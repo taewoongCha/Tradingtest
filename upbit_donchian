@@ -1,0 +1,126 @@
+import pyupbit
+import pandas as pd
+import pandas_ta as ta
+import time
+import requests
+from datetime import datetime
+
+# ==========================================
+# ⚙️ [사용자 입력 파라미터] - 모두 본인 정보로 채워주세요
+# ==========================================
+ACCESS_KEY = '업비트_액세스_키'
+SECRET_KEY = '업비트_시크릿_키'
+
+# 텔레그램 봇 정보
+TELEGRAM_TOKEN = '텔레그램_봇_토큰을_입력하세요'
+TELEGRAM_CHAT_ID = '내_채팅방_ID숫자를_입력하세요'
+
+TICKER = "KRW-BTC"       # 거래 종목
+INTERVAL = "minute15"    # 15분봉
+BUY_AMOUNT = 50000       # 1회 매수 금액 (원화 기준)
+
+DONCHIAN_PERIOD = 20
+WILLIAMS_PERIOD = 14
+VOLUME_MA_PERIOD = 20
+
+STOP_LOSS_PCT = 0.97     # 손절 라인: 매수 평균가 대비 -3%
+# ==========================================
+
+upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+
+# 텔레그램 메시지 전송 함수
+def send_telegram_message(text):
+    """텔레그램 봇을 통해 메시지를 전송합니다."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': text
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 실패: {e}")
+
+# 시작 알림 전송
+start_msg = "🚀 [업비트 자동매매 봇 시작]\n- 종목: BTC\n- 전략: 래리 윌리엄스 돌파 매매"
+print(start_msg)
+send_telegram_message(start_msg)
+
+def execute_trade():
+    try:
+        # 1. 데이터 조회 및 지표 계산
+        df = pyupbit.get_ohlcv(TICKER, interval=INTERVAL, count=100)
+        if df is None or df.empty:
+            return
+
+        donchian = ta.donchian(df['high'], df['low'], length=DONCHIAN_PERIOD)
+        df['donchian_upper'] = donchian[f'DCU_{DONCHIAN_PERIOD}_{DONCHIAN_PERIOD}']
+        df['donchian_lower'] = donchian[f'DCL_{DONCHIAN_PERIOD}_{DONCHIAN_PERIOD}']
+        df['donchian_mid'] = (df['donchian_upper'] + df['donchian_lower']) / 2
+        
+        df['willr'] = ta.willr(df['high'], df['low'], df['close'], length=WILLIAMS_PERIOD)
+        df['vol_ma'] = ta.sma(df['volume'], length=VOLUME_MA_PERIOD)
+
+        last_candle = df.iloc[-2]
+        price = last_candle['close']
+        d_upper = last_candle['donchian_upper']
+        d_mid = last_candle['donchian_mid']
+        willr = last_candle['willr']
+        vol = last_candle['volume']
+        vol_ma = last_candle['vol_ma']
+
+        # 2. 내 잔고 및 매수 평균가 확인
+        krw_balance = upbit.get_balance("KRW")
+        btc_balance = upbit.get_balance(TICKER)
+        avg_buy_price = upbit.get_avg_buy_price(TICKER)
+        current_btc_value = btc_balance * pyupbit.get_current_price(TICKER) if btc_balance else 0
+
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # [매수 검사]
+        if current_btc_value < 5000:
+            print(f"[{now}] 🔍 관망 중 | 현재가: {price:,.0f}원 | 상단돌파까지: {d_upper - price:,.0f}원 남음")
+            
+            buy_condition = (price >= d_upper) and (willr >= -20) and (vol > vol_ma)
+            
+            if buy_condition and krw_balance >= BUY_AMOUNT:
+                buy_msg = f"🟢 [매수 진입]\n- 가격: {price:,.0f}원\n- 사유: 상승 돌파 신호 포착"
+                print(buy_msg)
+                
+                # 주문 실행
+                upbit.buy_market_order(TICKER, BUY_AMOUNT)
+                # 텔레그램 전송
+                send_telegram_message(buy_msg)
+                
+        # [매도 검사]
+        else:
+            profit_rate = (price - avg_buy_price) / avg_buy_price * 100
+            print(f"[{now}] 📈 보유 중 | 현재 수익률: {profit_rate:.2f}% | 중심선(익절라인): {d_mid:,.0f}원")
+            
+            sell_cond_1 = price <= (avg_buy_price * STOP_LOSS_PCT)
+            sell_cond_2 = price <= d_mid
+            sell_cond_3 = willr <= -80
+
+            if sell_cond_1:
+                sell_msg = f"🔴 [손절 매도]\n- 현재가: {price:,.0f}원\n- 수익률: {profit_rate:.2f}%\n- 사유: 기계적 손절(-3%)"
+                print(sell_msg)
+                upbit.sell_market_order(TICKER, btc_balance)
+                send_telegram_message(sell_msg)
+                
+            elif sell_cond_2 or sell_cond_3:
+                sell_msg = f"🔵 [익절/약손절 매도]\n- 현재가: {price:,.0f}원\n- 수익률: {profit_rate:.2f}%\n- 사유: 추세 이탈 및 모멘텀 감소"
+                print(sell_msg)
+                upbit.sell_market_order(TICKER, btc_balance)
+                send_telegram_message(sell_msg)
+
+    except Exception as e:
+        error_msg = f"⚠️ [봇 에러 발생]\n내용: {e}"
+        print(error_msg)
+        send_telegram_message(error_msg)
+
+# ==========================================
+# 실행 루프
+# ==========================================
+while True:
+    execute_trade()
+    time.sleep(10)
